@@ -2,58 +2,87 @@ import eventlet
 eventlet.monkey_patch()
 
 from flask import Flask, request
-from flask_socketio import SocketIO, join_room, emit
-import random
-import string
+from flask_socketio import SocketIO, emit
+import time
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-rooms = {}
+# {sid: {"x":..., "y":..., "dir":..., "anim":..., "loc":..., "char":..., "bike":..., "name":..., "last_seen":...}}
+players = {}
 
-def generate_room_code():
-    return "".join(random.choices(string.ascii_uppercase, k=4))
+@socketio.on("connect")
+def on_connect():
+    print(f"[+] {request.sid} подключился. Всего: {len(players)}")
 
-@socketio.on("create_room")
-def handle_create_room():
-    code = generate_room_code()
-    while code in rooms:
-        code = generate_room_code()
-    rooms[code] = [request.sid]
-    join_room(code)
-    emit("room_created", {"code": code})
-
-@socketio.on("join_room_req")
-def handle_join_room(data):
-    code = data.get("code", "").upper().strip()
-    if code in rooms and len(rooms[code]) < 2:
-        rooms[code].append(request.sid)
-        join_room(code)
-        emit("room_joined", {"ok": True, "code": code})
-        emit("partner_joined", room=code, include_self=False)
-    else:
-        emit("room_joined", {"ok": False, "error": "Комната не найдена"})
+@socketio.on("register")
+def handle_register(data):
+    players[request.sid] = {
+        "x": 0, "y": 0, "dir": "down", "anim": "idle",
+        "loc": "home", "char": "fighter", "bike": False,
+        "name": data.get("name", "Игрок"),
+        "last_seen": time.time()
+    }
+    # Отправляем новому игроку список всех остальных
+    others = {sid: {k: v for k, v in p.items() if k != "last_seen"} 
+              for sid, p in players.items() if sid != request.sid}
+    emit("all_players", others)
 
 @socketio.on("state")
 def handle_state(data):
-    code = data.get("room")
-    if code and code in rooms:
-        emit("partner_state", data, room=code, include_self=False)
+    if request.sid not in players:
+        return
+    players[request.sid].update({
+        "x": data.get("x", 0),
+        "y": data.get("y", 0),
+        "dir": data.get("dir", "down"),
+        "anim": data.get("anim", "idle"),
+        "loc": data.get("loc", "home"),
+        "char": data.get("char", "fighter"),
+        "bike": data.get("bike", False),
+        "last_seen": time.time()
+    })
+    # Рассылаем всем ОСТАЛЬНЫМ игрокам
+    state_out = {
+        "sid": request.sid,
+        "x": players[request.sid]["x"],
+        "y": players[request.sid]["y"],
+        "dir": players[request.sid]["dir"],
+        "anim": players[request.sid]["anim"],
+        "loc": players[request.sid]["loc"],
+        "char": players[request.sid]["char"],
+        "bike": players[request.sid]["bike"],
+        "name": players[request.sid]["name"],
+    }
+    emit("player_update", state_out, broadcast=True, include_self=False)
 
 @socketio.on("disconnect")
-def handle_disconnect():
-    for code, sids in list(rooms.items()):
-        if request.sid in sids:
-            sids.remove(request.sid)
-            if not sids:
-                del rooms[code]
-            else:
-                emit("partner_left", room=code)
-            break
+def on_disconnect():
+    if request.sid in players:
+        del players[request.sid]
+    emit("player_left", {"sid": request.sid}, broadcast=True)
+    print(f"[-] {request.sid} отключился. Всего: {len(players)}")
+
+@socketio.on("ping_alive")
+def handle_ping():
+    if request.sid in players:
+        players[request.sid]["last_seen"] = time.time()
+
+# Чистим "мёртвых" игроков (не было пинга > 30 сек)
+def cleanup_loop():
+    while True:
+        eventlet.sleep(15)
+        now = time.time()
+        dead = [sid for sid, p in players.items() if now - p.get("last_seen", 0) > 30]
+        for sid in dead:
+            del players[sid]
+            socketio.emit("player_left", {"sid": sid})
+
+eventlet.spawn(cleanup_loop)
 
 @app.route("/")
 def index():
-    return "Zombix Online Server is running!"
+    return f"Zombix Global Server. Players online: {len(players)}"
 
 if __name__ == "__main__":
     socketio.run(app, host="0.0.0.0", port=10000)
